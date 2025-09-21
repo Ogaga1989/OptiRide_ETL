@@ -1,0 +1,11 @@
+
+database:
+  host: "localhost"
+  port: 5432
+  dbname: "bikeshare_dw"
+  user: "postgres"
+  password: "Eng0802097@"
+
+storage:
+  raw: "./data/raw"
+  processed: "./data/processed"
