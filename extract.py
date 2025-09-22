@@ -1,8 +1,8 @@
 import json    # Store raw extracted data
-import os
+import os     # creating directories/folfers and paths
 
-import requests
-import yaml
+import requests   # For sending HTTP request/connections to the APIs
+import yaml       # for configuration pf files data
 
 from logger import get_logger
 
