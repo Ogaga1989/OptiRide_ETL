@@ -25,9 +25,7 @@ CREATE TABLE fact_bike_weather (
     weather_id BIGINT REFERENCES dim_weather(weather_id),
     timestamp TIMESTAMP NOT NULL,
     free_bikes INT,
-    empty_slots INT,
-    total_slots INT,
-    ebikes INT
+    total_slots INT
 );
 
 

@@ -1,9 +1,12 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, to_timestamp, monotonically_increasing_id
+from pyspark.sql.functions import col, to_timestamp, monotonically_increasing_id, date_trunc
+from pyspark.sql import Row
 import json, os, yaml
 from logger import get_logger
 
 logger = get_logger("Transform")
+
+
 def transform():
     with open("./config.yaml", "r") as f:
         config = yaml.safe_load(f)
@@ -13,7 +16,8 @@ def transform():
     logger.info("Initialize processed staging area, if not exists")
     os.makedirs(processed_dir, exist_ok=True)
 
-    spark = SparkSession.builder.appName("BikeWeatherPipeline").getOrCreate()
+    logger.info("Starting the spark session...")
+    spark = SparkSession.builder.appName("BikeWeatherPipeline").config("spark.hadoop.io.native.lib.available", "false").getOrCreate()
 
     logger.info("Loading raw data...")
     with open(os.path.join(raw_dir, "bike_raw.json"), "r") as f:
@@ -24,26 +28,57 @@ def transform():
 
     # ---- Bike stations ----
     stations = bike_data["network"]["stations"]
-    df_bikes = spark.createDataFrame(stations)
+    station_data = []
+    for station in stations:
+    # station = stations[0]
+        stations_id = station.get('id')
+        station_name = station.get('name')
+        latitude = station.get('latitude')
+        longitude = station.get('longitude')
+        address = station_name
+        timestamp = station.get('timestamp')
+        free_bikes = station.get('free_bikes')
+        has_ebikes = station.get('extra', {}).get('has_ebikes')
+        slots = station.get('extra', {}).get('slots')
+
+        data = {
+            'station_id': stations_id,
+            'station_name': station_name,
+            'latitude': latitude,
+            'longitude': longitude,
+            'address': address,
+            'timestamp': timestamp,
+            'free_bikes': free_bikes,
+            'has_ebikes': has_ebikes,
+            'slots': slots
+        }
+
+        station_data.append(data)
+    df_bikes = spark.createDataFrame(station_data)
+    # df_bikes = spark.createDataFrame([Row(**s) for s in stations])
 
     df_dim_station = df_bikes.select(
-        col("id").alias("station_id"),
-        col("name").alias("station_name"),
+        col("station_id"),
+        col("station_name"),
         col("latitude"),
         col("longitude"),
-        col("extra.address").alias("address"),
-        col("extra.has_ebikes").alias("has_ebikes"),
-        col("extra.slots").alias("slots")
+        col("address"),
+        col("has_ebikes"),
+        col("slots")
     ).dropDuplicates(["station_id"])
 
+    timestamp_format = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX'Z'"
+    # Timestamp format 2023-10-01T14:00:00+00:00 is not recognized by default, so we use to_timestamp with format
+
+
     df_fact_bikes = df_bikes.select(
-        col("id").alias("station_id"),
-        to_timestamp(col("timestamp")).alias("timestamp"),
+        col("station_id"),
+        to_timestamp(col("timestamp"), timestamp_format).alias('timestamp'),
         col("free_bikes"),
-        col("empty_slots"),
-        (col("free_bikes") + col("empty_slots")).alias("total_slots"),
-        col("extra.ebikes").alias("ebikes")
+        col("slots"),
+        col("has_ebikes")
     )
+    weather_timestamp_format = "yyyy-MM-dd'T'HH:mm"
 
     # ---- Weather ----
     hourly = weather_data["hourly"]
@@ -57,9 +92,22 @@ def transform():
             hourly["relativehumidity_2m"]
         ),
         schema=["time", "temperature", "precipitation", "wind_speed", "cloud_cover", "humidity"]
-    ).withColumn("timestamp", to_timestamp("time"))
+    ).withColumn("timestamp", to_timestamp("time", weather_timestamp_format))
 
-    df_dim_weather = df_weather.withColumn("weather_id", monotonically_increasing_id())
+    df_dim_weather = df_weather.withColumn("weather_id", monotonically_increasing_id()).select(
+        "weather_id", 
+        "timestamp", 
+        "temperature", 
+        "precipitation", 
+        "wind_speed", 
+        "cloud_cover", 
+        "humidity"
+    )
+
+    # --- Align timestamps to the same hour (ensures successful join) ---
+    logger.info("Aligning timestamps to the hour for bike and weather data...")
+    df_fact_bikes = df_fact_bikes.withColumn("timestamp", date_trunc("hour", col("timestamp")))
+    df_dim_weather = df_dim_weather.withColumn("timestamp", date_trunc("hour", col("timestamp")))
 
     # Join fact_bikes with weather by timestamp
     df_fact = df_fact_bikes.join(
@@ -67,13 +115,40 @@ def transform():
         on="timestamp",
         how="left"
     ).select(
-        "station_id", "timestamp", "free_bikes", "empty_slots", "total_slots", "ebikes", "weather_id"
+        "station_id", "timestamp", "free_bikes", "slots", "has_ebikes", "weather_id"
     )
 
-    # Save transformed data → processed area
-    df_dim_station.write.mode("overwrite").json(os.path.join(processed_dir, "dim_station.json"))
-    df_dim_weather.write.mode("overwrite").json(os.path.join(processed_dir, "dim_weather.json"))
-    df_fact.write.mode("overwrite").json(os.path.join(processed_dir, "fact_bike_weather.json"))
+
+
+
+    '''# Create hour-aligned timestamps, but keep original timestamp column untouched
+    df_fact_bikes = df_fact_bikes.withColumn("timestamp_hour", date_trunc("hour", col("timestamp")))
+    df_dim_weather = df_dim_weather.withColumn("timestamp_hour", date_trunc("hour", col("timestamp")))
+
+    # Join on the hour-truncated timestamp
+    df_fact = df_fact_bikes.join(
+        df_dim_weather,
+        on="timestamp_hour",
+        how="left"
+    ).select(
+        "station_id",
+        # use the original (untruncated) timestamp column for the output
+        df_fact_bikes["timestamp"], 
+        "free_bikes",
+        "slots",
+        "has_ebikes",
+        "weather_id"
+    )'''
+
+
+
+
+
+    # Save transformed data → processed staging area (Parquet instead of JSON)
+    df_dim_station.write.mode("overwrite").parquet(os.path.join(processed_dir, "dim_station"))
+    df_dim_weather.write.mode("overwrite").parquet(os.path.join(processed_dir, "dim_weather"))
+    df_fact.write.mode("overwrite").parquet(os.path.join(processed_dir, "fact_bike_weather"))
+
 
     logger.info("Stage 2 Transform complete. Data stored in processed area.")
 
